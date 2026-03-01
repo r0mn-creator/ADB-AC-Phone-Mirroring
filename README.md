@@ -4,3 +4,7 @@ mirror folder needs to go inside, steamapps\common\assettocorsa\extension\lua\ca
 I'm not a programmer, I just had an idea. If anyone can make this better please go for it. I used AI to help me make it so I'm sure there's probably
 better ways to do this. For starters theres lag and no audio. I just wanted a way to know who's calling me or texting me while I'm in VR
 driving around in the game.
+
+
+See Demo Here:
+https://www.youtube.com/watch?v=8fUeNXfJD1U
