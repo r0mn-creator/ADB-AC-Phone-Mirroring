@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ADB Controller</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:100%;height:100%;overflow:hidden;background:#000}
+
+/* Video fills screen, letterboxed. CSS handles both orientations automatically
+   because we update width/height style from JS whenever dimensions are known. */
+#screen{
+  position:absolute;top:50%;left:50%;
+  transform:translate(-50%,-50%);
+  display:block;cursor:crosshair;
+  /* smooth rotation transition when phone rotates */
+  transition:width .25s ease, height .25s ease;
+}
+
+#connect-btn{
+  position:fixed;bottom:18px;right:18px;z-index:100;
+  display:flex;align-items:center;gap:7px;padding:8px 14px;
+  background:rgba(0,0,0,0.55);border:1px solid rgba(255,255,255,0.18);
+  border-radius:8px;color:rgba(255,255,255,0.75);
+  font-family:ui-monospace,monospace;font-size:12px;
+  cursor:pointer;backdrop-filter:blur(10px);user-select:none;
+  transition:background .2s,border-color .2s,color .2s;
+}
+#connect-btn:hover{background:rgba(0,229,255,0.15);border-color:rgba(0,229,255,0.5);color:#00e5ff}
+#connect-btn:active{transform:scale(0.96)}
+.dot{width:7px;height:7px;border-radius:50%;background:rgba(255,255,255,0.25);flex-shrink:0;transition:background .3s,box-shadow .3s}
+#connect-btn.live .dot{background:#00e5ff;box-shadow:0 0 7px #00e5ff}
+
+#toast{
+  position:fixed;bottom:18px;left:50%;
+  transform:translateX(-50%) translateY(10px);
+  background:rgba(0,0,0,0.7);border:1px solid rgba(255,255,255,0.12);
+  color:rgba(255,255,255,0.8);padding:6px 16px;border-radius:20px;
+  font-family:ui-monospace,monospace;font-size:12px;
+  pointer-events:none;opacity:0;transition:opacity .22s,transform .22s;z-index:200;
+}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+
+<video id="screen" autoplay muted playsinline></video>
+<!-- Hidden audio element for phone audio -->
+<audio id="phoneAudio" autoplay></audio>
+
+<button id="connect-btn" onclick="toggleSession()">
+  <span class="dot"></span>
+  <span id="btn-label">Connect</span>
+</button>
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fMP4 box sizes (verified in Python against ISO 14496-12):
+//   Video init: 657B for SPS=18B, PPS=5B, 720×1600
+//   moof: 100B, data_offset@byte84 = 108
+//   trun flags = 0x000701 → bytes [0x00, 0x00, 0x07, 0x01]
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let ws=null, audioWs=null;
+let videoMS=null, videoSB=null;
+let audioMS=null, audioSB=null;
+let deviceW=0, deviceH=0;
+let isConnected=false, pointerDown=false, lastX=0, lastY=0;
+let videoSeq=0, videoIdx=0;
+let audioSeq=0, audioIdx=0;
+let videoQueue=[], audioPending=[], sbBusy=false;
+let savedSPS=null, savedPPS=null, videoInitDone=false, gotIDR=false;
+let savedASC=null, audioInitDone=false;
+
+const video      = document.getElementById('screen');
+const audioEl    = document.getElementById('phoneAudio');
+const btn        = document.getElementById('connect-btn');
+
+// ── Fit video to window (handles portrait and landscape) ──────────────────────
+function fit(){
+  if(!deviceW||!deviceH) return;
+  const s=Math.min(window.innerWidth/deviceW, window.innerHeight/deviceH);
+  video.style.width  = Math.round(deviceW*s)+'px';
+  video.style.height = Math.round(deviceH*s)+'px';
+}
+window.addEventListener('resize', fit);
+
+// Called when video natural dimensions change (phone rotates)
+video.addEventListener('loadedmetadata', ()=>{
+  if(video.videoWidth && (video.videoWidth!==deviceW || video.videoHeight!==deviceH)){
+    deviceW=video.videoWidth; deviceH=video.videoHeight; fit();
+  }
+});
+
+function setDims(w,h){
+  if(deviceW===w&&deviceH===h) return;
+  deviceW=w; deviceH=h; fit();
+}
+
+// ── Coordinate mapping ────────────────────────────────────────────────────────
+function toDevice(cx,cy){
+  const r=video.getBoundingClientRect();
+  return{x:Math.round((cx-r.left)/r.width*deviceW), y:Math.round((cy-r.top)/r.height*deviceH)};
+}
+
+// ── Binary helpers ────────────────────────────────────────────────────────────
+const te=new TextEncoder();
+function u16(v){return new Uint8Array([(v>>8)&0xFF,v&0xFF]);}
+function u32(v){const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,v>>>0,false);return b;}
+function i32(v){const b=new Uint8Array(4);new DataView(b.buffer).setInt32(0,v|0,false);return b;}
+function u64(v){const b=new Uint8Array(8),dv=new DataView(b.buffer);dv.setUint32(0,Math.floor(v/0x100000000)>>>0,false);dv.setUint32(4,v>>>0,false);return b;}
+function cat(...a){const t=a.reduce((s,x)=>s+x.length,0),o=new Uint8Array(t);let p=0;for(const x of a){o.set(x,p);p+=x.length;}return o;}
+function box(t,...p){const d=cat(...p);return cat(u32(8+d.length),te.encode(t),d);}
+
+// ── Annex-B parser ────────────────────────────────────────────────────────────
+function parseAB(buf){
+  const nals=[];
+  for(let i=0;i<buf.length;){
+    const s4=i+3<buf.length&&buf[i]===0&&buf[i+1]===0&&buf[i+2]===0&&buf[i+3]===1;
+    const s3=!s4&&i+2<buf.length&&buf[i]===0&&buf[i+1]===0&&buf[i+2]===1;
+    if(!s4&&!s3){i++;continue;}
+    i+=s4?4:3;
+    const s=i,t=buf[i]&0x1f;
+    let e=buf.length;
+    for(let j=i+1;j<buf.length-2;j++){
+      if(buf[j]===0&&buf[j+1]===0&&(buf[j+2]===1||(j+3<buf.length&&buf[j+2]===0&&buf[j+3]===1))){e=j;break;}
+    }
+    nals.push({type:t,data:buf.slice(s,e)});i=e;
+  }
+  return nals;
+}
+
+function toAVCC(buf){
+  const nals=parseAB(buf);
+  let tot=0;for(const n of nals)tot+=4+n.data.length;
+  const out=new Uint8Array(tot);let o=0;
+  for(const n of nals){
+    const l=n.data.length;
+    out[o]=(l>>>24)&0xFF;out[o+1]=(l>>>16)&0xFF;out[o+2]=(l>>>8)&0xFF;out[o+3]=l&0xFF;
+    out.set(n.data,o+4);o+=4+l;
+  }
+  return out;
+}
+
+// ── VIDEO fMP4 ────────────────────────────────────────────────────────────────
+function buildVideoInit(sps,pps,W,H){
+  const avcC=box('avcC',cat(
+    new Uint8Array([1,sps[1],sps[2],sps[3],0xFF,0xE1]),u16(sps.length),sps,
+    new Uint8Array([1]),u16(pps.length),pps));
+  const avc1=box('avc1',
+    new Uint8Array(6),u16(1),new Uint8Array(16),
+    u16(W),u16(H),u32(0x00480000),u32(0x00480000),u32(0),u16(1),
+    new Uint8Array(32),u16(0x0018),new Uint8Array([0xFF,0xFF]),avcC);
+  const stbl=box('stbl',
+    box('stsd',new Uint8Array([0,0,0,0]),u32(1),avc1),
+    box('stts',new Uint8Array([0,0,0,0]),u32(0)),
+    box('stsc',new Uint8Array([0,0,0,0]),u32(0)),
+    box('stsz',new Uint8Array([0,0,0,0]),u32(0),u32(0)),
+    box('stco',new Uint8Array([0,0,0,0]),u32(0)));
+  const minf=box('minf',
+    box('vmhd',new Uint8Array([0,0,0,1]),u16(0),u16(0),u16(0),u16(0)),
+    box('dinf',box('dref',new Uint8Array([0,0,0,0]),u32(1),box('url ',new Uint8Array([0,0,0,1])))),
+    stbl);
+  const mdia=box('mdia',
+    box('mdhd',new Uint8Array([0,0,0,0]),u32(0),u32(0),u32(90000),u32(0),u16(0x55C4),u16(0)),
+    box('hdlr',new Uint8Array([0,0,0,0]),u32(0),te.encode('vide'),u32(0),u32(0),u32(0),te.encode('VideoHandler\0')),
+    minf);
+  const tkhd=box('tkhd',
+    new Uint8Array([0,0,0,3]),u32(0),u32(0),u32(1),u32(0),u32(0),u32(0),u32(0),
+    u16(0),u16(0),u16(0),u16(0),
+    u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000),
+    u32(W<<16),u32(H<<16));
+  const mvhd=box('mvhd',
+    new Uint8Array([0,0,0,0]),u32(0),u32(0),u32(90000),u32(0xFFFFFFFF),
+    u32(0x00010000),u16(0x0100),u16(0),u32(0),u32(0),
+    u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000),
+    u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(2));
+  const ftyp=box('ftyp',te.encode('isom'),u32(0),te.encode('isomiso2avc1mp41'));
+  const moov=box('moov',mvhd,
+    box('trak',tkhd,mdia),
+    box('mvex',box('trex',new Uint8Array([0,0,0,0]),u32(1),u32(1),u32(0),u32(0),u32(0))));
+  return cat(ftyp,moov);
+}
+
+function buildVideoSeg(avccData,isIDR,idx){
+  const DUR=3000;
+  videoSeq++;
+  const trun=box('trun',
+    new Uint8Array([0x00,0x00,0x07,0x01]),  // flags=0x000701
+    u32(1),i32(0),u32(DUR),u32(avccData.length),u32(isIDR?0x02000000:0x01010000));
+  const traf=box('traf',
+    box('tfhd',new Uint8Array([0,0,0,0]),u32(1)),
+    box('tfdt',new Uint8Array([1,0,0,0]),u64(idx*DUR)),
+    trun);
+  const moof=box('moof',box('mfhd',new Uint8Array([0,0,0,0]),u32(videoSeq)),traf);
+  // patch data_offset at byte 84
+  new DataView(moof.buffer).setInt32(84, moof.length+8, false);
+  return cat(moof, box('mdat',avccData));
+}
+
+// ── AUDIO fMP4 ────────────────────────────────────────────────────────────────
+// AAC-LC in fMP4: AudioSpecificConfig (from scrcpy config packet) → esds box
+function parseASC(asc){
+  // AudioSpecificConfig bit layout:
+  //   5 bits: audioObjectType
+  //   4 bits: samplingFrequencyIndex
+  //   4 bits: channelConfiguration
+  const freq_table=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350];
+  const freqIdx = ((asc[0]&0x07)<<1)|((asc[1]>>7)&0x01);
+  return{
+    samplerate: freq_table[freqIdx]||44100,
+    channels:   (asc[1]>>3)&0x0f||2,
+  };
+}
+
+function buildAudioInit(asc){
+  const {samplerate,channels}=parseASC(asc);
+
+  // ES_Descriptor wrapping AudioSpecificConfig
+  const decSpecific = cat(new Uint8Array([0x05,asc.length]),asc);
+  const decConfig   = cat(
+    new Uint8Array([0x04, 13+decSpecific.length,
+      0x40,     // objectTypeIndication = Audio ISO/IEC 14496-3
+      0x15,     // streamType=audio(0x05<<2)|reserved(1)
+      0,0,0,    // bufferSizeDB
+      0,0,0,0,  // maxBitrate
+      0,0,0,0,  // avgBitrate
+    ]),decSpecific);
+  const slConfig = new Uint8Array([0x06,0x01,0x02]);
+  const esDesc   = cat(new Uint8Array([0x03, 3+decConfig.length+slConfig.length, 0x00,0x01,0x00]),
+                       decConfig, slConfig);
+  const esds = box('esds', new Uint8Array([0,0,0,0]), esDesc);
+
+  const mp4a=box('mp4a',
+    new Uint8Array(6),u16(1),new Uint8Array(8),
+    u16(channels),u16(16),u16(0),u16(0),
+    u32(samplerate<<16),  // 16.16 fixed-point samplerate
+    esds);
+  const stbl=box('stbl',
+    box('stsd',new Uint8Array([0,0,0,0]),u32(1),mp4a),
+    box('stts',new Uint8Array([0,0,0,0]),u32(0)),
+    box('stsc',new Uint8Array([0,0,0,0]),u32(0)),
+    box('stsz',new Uint8Array([0,0,0,0]),u32(0),u32(0)),
+    box('stco',new Uint8Array([0,0,0,0]),u32(0)));
+  const minf=box('minf',
+    box('smhd',new Uint8Array([0,0,0,0]),u16(0),u16(0)),
+    box('dinf',box('dref',new Uint8Array([0,0,0,0]),u32(1),box('url ',new Uint8Array([0,0,0,1])))),
+    stbl);
+  const mdia=box('mdia',
+    box('mdhd',new Uint8Array([0,0,0,0]),u32(0),u32(0),u32(samplerate),u32(0),u16(0x55C4),u16(0)),
+    box('hdlr',new Uint8Array([0,0,0,0]),u32(0),te.encode('soun'),u32(0),u32(0),u32(0),te.encode('SoundHandler\0')),
+    minf);
+  const tkhd=box('tkhd',
+    new Uint8Array([0,0,0,3]),u32(0),u32(0),u32(2),u32(0),u32(0),u32(0),u32(0),
+    u16(0),u16(0),u16(0x0100),u16(0),  // volume=1.0 for audio
+    u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000),
+    u32(0),u32(0));  // width=0,height=0 for audio track
+  const mvhd=box('mvhd',
+    new Uint8Array([0,0,0,0]),u32(0),u32(0),u32(samplerate),u32(0xFFFFFFFF),
+    u32(0x00010000),u16(0x0100),u16(0),u32(0),u32(0),
+    u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000),
+    u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(2));
+  const ftyp=box('ftyp',te.encode('isom'),u32(0),te.encode('isomiso2mp41'));
+  const moov=box('moov',mvhd,
+    box('trak',tkhd,mdia),
+    box('mvex',box('trex',new Uint8Array([0,0,0,0]),u32(2),u32(1),u32(0),u32(0),u32(0))));
+  return cat(ftyp,moov);
+}
+
+function buildAudioSeg(aacData,idx){
+  // AAC-LC: 1024 samples per frame, timescale = samplerate
+  const DUR=1024;
+  audioSeq++;
+  const trun=box('trun',
+    new Uint8Array([0x00,0x00,0x07,0x01]),
+    u32(1),i32(0),u32(DUR),u32(aacData.length),u32(0x02000000));
+  const traf=box('traf',
+    box('tfhd',new Uint8Array([0,0,0,0]),u32(2)),  // track_id=2
+    box('tfdt',new Uint8Array([1,0,0,0]),u64(idx*DUR)),
+    trun);
+  const moof=box('moof',box('mfhd',new Uint8Array([0,0,0,0]),u32(audioSeq)),traf);
+  new DataView(moof.buffer).setInt32(84, moof.length+8, false);
+  return cat(moof, box('mdat',aacData));
+}
+
+// ── MSE plumbing ──────────────────────────────────────────────────────────────
+function teardownVideo(){
+  videoQueue=[];sbBusy=false;videoInitDone=false;gotIDR=false;videoIdx=0;videoSeq=0;
+  if(videoMS&&videoMS.readyState==='open')try{videoMS.endOfStream();}catch(_){}
+  video.src='';videoSB=null;videoMS=null;
+}
+
+function setupVideo(){
+  teardownVideo();
+  videoMS=new MediaSource();
+  video.src=URL.createObjectURL(videoMS);
+  videoMS.addEventListener('sourceopen',()=>{
+    const mime='video/mp4; codecs="avc1.'
+      +savedSPS[1].toString(16).padStart(2,'0')
+      +savedSPS[2].toString(16).padStart(2,'0')
+      +savedSPS[3].toString(16).padStart(2,'0')+'"';
+    if(!MediaSource.isTypeSupported(mime)){toast('⚠ Video codec unsupported');return;}
+    videoSB=videoMS.addSourceBuffer(mime);
+    videoSB.mode='sequence';
+    videoSB.addEventListener('updateend',drainVideo);
+    videoSB.addEventListener('error',()=>{
+      if(savedSPS&&savedPPS) setTimeout(setupVideo,500);
+    });
+    videoSB.appendBuffer(buildVideoInit(savedSPS,savedPPS,deviceW||720,deviceH||1600));
+    videoInitDone=true;
+  },{once:true});
+}
+
+function enqueueVideo(d){videoQueue.push(d);drainVideo();}
+function drainVideo(){
+  if(sbBusy||!videoSB||videoSB.updating||!videoQueue.length)return;
+  const seg=videoQueue.shift();
+  try{videoSB.appendBuffer(seg);}
+  catch(e){
+    if(e.name==='QuotaExceededError'&&videoSB.buffered.length){
+      const end=videoSB.buffered.end(videoSB.buffered.length-1);
+      try{videoSB.remove(0,Math.max(0,end-5));}catch(_){}
+    }
+  }
+}
+
+function teardownAudio(){
+  audioPending=[];audioInitDone=false;audioIdx=0;audioSeq=0;
+  if(audioMS&&audioMS.readyState==='open')try{audioMS.endOfStream();}catch(_){}
+  audioEl.src='';audioSB=null;audioMS=null;
+}
+
+function setupAudio(){
+  teardownAudio();
+  audioMS=new MediaSource();
+  audioEl.src=URL.createObjectURL(audioMS);
+  audioMS.addEventListener('sourceopen',()=>{
+    const {samplerate,channels}=parseASC(savedASC);
+    const mime=`audio/mp4; codecs="mp4a.40.2"`;
+    if(!MediaSource.isTypeSupported(mime)){return;}
+    audioSB=audioMS.addSourceBuffer(mime);
+    audioSB.mode='sequence';
+    audioSB.addEventListener('updateend',drainAudio);
+    audioSB.appendBuffer(buildAudioInit(savedASC));
+    audioInitDone=true;
+    // Unmute audio element now that we have a stream
+    audioEl.muted=false;
+    audioEl.play().catch(()=>{
+      // Autoplay blocked — user must interact first; will resume on first touch
+    });
+  },{once:true});
+}
+
+function enqueueAudio(d){audioPending.push(d);drainAudio();}
+function drainAudio(){
+  if(!audioSB||audioSB.updating||!audioPending.length)return;
+  const seg=audioPending.shift();
+  try{audioSB.appendBuffer(seg);}
+  catch(e){
+    if(e.name==='QuotaExceededError'&&audioSB.buffered.length){
+      const end=audioSB.buffered.end(audioSB.buffered.length-1);
+      try{audioSB.remove(0,Math.max(0,end-3));}catch(_){}
+    }
+  }
+}
+
+// ── Resume audio after user interaction (browser autoplay policy) ─────────────
+function tryResumeAudio(){
+  if(audioEl.paused&&audioEl.src&&audioEl.src!==location.href){
+    audioEl.play().catch(()=>{});
+  }
+}
+document.addEventListener('pointerdown', tryResumeAudio, {passive:true});
+
+// ── Handle video packets ──────────────────────────────────────────────────────
+function handleVideoPacket(buf){
+  const bytes=new Uint8Array(buf);
+  if(bytes.length<9)return;
+  const isCfg=!!(bytes[0]&1);
+  const nal=bytes.slice(9);
+
+  if(isCfg){
+    const nals=parseAB(nal);
+    const sps=nals.find(n=>n.type===7);
+    const pps=nals.find(n=>n.type===8);
+    if(!sps||!pps)return;
+    savedSPS=sps.data; savedPPS=pps.data;
+    setupVideo();
+    return;
+  }
+  if(!videoInitDone||!videoSB)return;
+  const nals=parseAB(nal);
+  const isIDR=nals.some(n=>n.type===5);
+  if(!gotIDR&&!isIDR)return;
+  gotIDR=true;
+  if(videoQueue.length>5)videoQueue.splice(0,videoQueue.length-5);
+  enqueueVideo(buildVideoSeg(toAVCC(nal),isIDR,videoIdx++));
+}
+
+// ── Handle audio packets ──────────────────────────────────────────────────────
+function handleAudioPacket(buf){
+  const bytes=new Uint8Array(buf);
+  if(bytes.length<9)return;
+  const isCfg=!!(bytes[0]&1);
+  const data=bytes.slice(9);
+
+  if(isCfg){
+    // data IS the AudioSpecificConfig (2-5 bytes)
+    savedASC=data;
+    setupAudio();
+    return;
+  }
+  if(!audioInitDone||!audioSB)return;
+  if(audioPending.length>20)audioPending.splice(0,audioPending.length-20);
+  enqueueAudio(buildAudioSeg(data,audioIdx++));
+}
+
+// ── Handle JSON messages ──────────────────────────────────────────────────────
+function handleJSON(msg){
+  if(msg.type==='device_info'){
+    setDims(msg.width,msg.height);
+    setLive(true);
+    toast(msg.name+'  '+msg.width+'×'+msg.height);
+  } else if(msg.type==='error'){
+    toast('⚠ '+msg.msg);
+  }
+}
+
+// ── WebSocket: video ──────────────────────────────────────────────────────────
+function connectVideoWS(){
+  ws=new WebSocket('ws://'+location.host+'/ws');
+  ws.binaryType='arraybuffer';
+  ws.onopen=()=>{};
+  ws.onclose=()=>setTimeout(connectVideoWS,2000);
+  ws.onerror=()=>{};
+  ws.onmessage=e=>{
+    if(e.data instanceof ArrayBuffer) handleVideoPacket(e.data);
+    else{try{handleJSON(JSON.parse(e.data));}catch(_){}}
+  };
+}
+
+// ── WebSocket: audio ──────────────────────────────────────────────────────────
+function connectAudioWS(){
+  audioWs=new WebSocket('ws://'+location.host+'/ws/audio');
+  audioWs.binaryType='arraybuffer';
+  audioWs.onopen=()=>{};
+  audioWs.onclose=()=>setTimeout(connectAudioWS,2000);
+  audioWs.onerror=()=>{};
+  audioWs.onmessage=e=>{
+    if(e.data instanceof ArrayBuffer) handleAudioPacket(e.data);
+  };
+}
+
+function send(o){if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify(o));}
+
+// ── Session ───────────────────────────────────────────────────────────────────
+async function toggleSession(){
+  if(isConnected){
+    await fetch('/api/stop',{method:'POST'}).catch(()=>{});
+    teardownVideo();teardownAudio();
+    setLive(false);
+    savedSPS=null;savedPPS=null;savedASC=null;
+    toast('Disconnected');
+  } else {
+    document.getElementById('btn-label').textContent='Connecting…';
+    const r=await fetch('/api/start',{method:'POST'}).catch(()=>null);
+    if(!r){toast('⚠ Server unreachable');document.getElementById('btn-label').textContent='Connect';return;}
+    const j=await r.json();
+    if(!j.ok){toast('⚠ '+(j.error||'Failed'));document.getElementById('btn-label').textContent='Connect';}
+  }
+}
+
+function setLive(on){
+  isConnected=on;btn.className=on?'live':'';
+  document.getElementById('btn-label').textContent=on?'Disconnect':'Connect';
+}
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+video.addEventListener('pointerdown',e=>{
+  tryResumeAudio();
+  if(e.button!==0&&e.pointerType==='mouse')return;
+  video.setPointerCapture(e.pointerId);pointerDown=true;
+  const p=toDevice(e.clientX,e.clientY);lastX=p.x;lastY=p.y;
+  send({type:'touch_down',x:p.x,y:p.y});
+});
+video.addEventListener('pointermove',e=>{
+  if(!pointerDown)return;
+  const p=toDevice(e.clientX,e.clientY);
+  if(p.x===lastX&&p.y===lastY)return;
+  lastX=p.x;lastY=p.y;send({type:'touch_move',x:p.x,y:p.y});
+});
+video.addEventListener('pointerup',e=>{
+  if(!pointerDown)return;pointerDown=false;
+  const p=toDevice(e.clientX,e.clientY);send({type:'touch_up',x:p.x,y:p.y});
+});
+video.addEventListener('pointercancel',()=>{
+  if(!pointerDown)return;pointerDown=false;
+  send({type:'touch_up',x:lastX,y:lastY});
+});
+video.addEventListener('wheel',e=>{
+  e.preventDefault();
+  const p=toDevice(e.clientX,e.clientY);
+  send({type:'scroll',x:p.x,y:p.y,hscroll:0,vscroll:e.deltaY>0?-1:1});
+},{passive:false});
+video.addEventListener('contextmenu',e=>e.preventDefault());
+
+const KM={Backspace:67,Tab:61,Enter:66,Escape:111,Delete:112,ArrowLeft:21,ArrowRight:22,ArrowUp:19,ArrowDown:20,Home:122,End:123,PageUp:92,PageDown:93};
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT')return;
+  if(KM[e.key]){e.preventDefault();send({type:'keycode',keycode:KM[e.key]});return;}
+  if(e.key.length===1&&!e.ctrlKey&&!e.metaKey){e.preventDefault();send({type:'text',text:e.key});}
+});
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+let toastTimer;
+function toast(m){
+  const el=document.getElementById('toast');
+  el.textContent=m;el.classList.add('show');
+  clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),3000);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+setInterval(()=>send({type:'ping'}),10000);
+connectVideoWS();
+connectAudioWS();
+
+fetch('/api/status').then(r=>r.json()).then(res=>{
+  if(res.running){setDims(res.width,res.height);setLive(true);toast((res.name||'Android')+'  '+res.width+'×'+res.height);}
+}).catch(()=>{});
+</script>
+</body>
+</html>
