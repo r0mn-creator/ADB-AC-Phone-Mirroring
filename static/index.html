@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<!--
+  Phone Mirror — Browser Frontend (index.html)
+  ==============================================
+  Runs inside CSP's CEF browser widget (or any Chromium browser).
+  Receives H.264 video + AAC audio from server.py over WebSocket.
+  Sends touch/key/scroll input back to server.py → phone.
+  
+  ROTATE BUTTON: bottom-right corner, swaps display dimensions
+  on click so a portrait stream displays as landscape and vice versa.
+  
+  Goes in: adb_web_controller/static/index.html
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">                            <!-- UTF-8 character encoding -->
+<title>Phone Mirror</title>                        <!-- Page title -->
+<style>
+/* ── Reset all margins/padding for fullscreen display ──────────────────── */
+*{box-sizing:border-box;margin:0;padding:0}
+
+/* ── Body: fullscreen black, no scrollbars ─────────────────────────────── */
+html,body{width:100%;height:100%;overflow:hidden;background:#000}
+
+/* ── Video element: centered, letterboxed, lowest z-layer ──────────────── */
+#screen{
+  position:absolute;              /* Position freely on page */
+  top:50%;left:50%;               /* Center anchor point */
+  transform:translate(-50%,-50%); /* True centering */
+  display:block;                  /* Block element */
+  cursor:crosshair;               /* Crosshair cursor for precision touch */
+  z-index:0;                      /* CRITICAL: keep below buttons (CEF compositing) */
+  transition:width .25s ease, height .25s ease;  /* Smooth resize on rotation */
+}
+
+/* ── Toast notification: centered bottom popup ─────────────────────────── */
+#toast{
+  position:fixed;                 /* Fixed to viewport */
+  bottom:18px;left:50%;           /* Bottom center */
+  transform:translateX(-50%) translateY(10px);  /* Center + slide offset */
+  background:rgba(0,0,0,0.7);    /* Dark semi-transparent */
+  border:1px solid rgba(255,255,255,0.12);      /* Subtle border */
+  color:rgba(255,255,255,0.8);   /* Light text */
+  padding:6px 16px;              /* Internal padding */
+  border-radius:20px;            /* Pill shape */
+  font-family:ui-monospace,monospace;  /* Monospace font */
+  font-size:12px;                /* Small text */
+  pointer-events:none;           /* Click-through (don't block touch) */
+  opacity:0;                     /* Hidden by default */
+  transition:opacity .22s,transform .22s;  /* Fade in/out animation */
+  z-index:200;                   /* Above video but below button */
+}
+#toast.show{                     /* Visible state */
+  opacity:1;                     /* Fully visible */
+  transform:translateX(-50%) translateY(0);  /* Slide into position */
+}
+
+/* ── Rotate button: bottom-right, replaces old connect button ──────────── */
+#rotate-btn{
+  position:fixed;                 /* Fixed to viewport (not affected by scroll) */
+  bottom:18px;                    /* 18px from bottom edge */
+  right:18px;                     /* 18px from right edge */
+  z-index:99999;                  /* MAXIMUM z-index — must be above EVERYTHING */
+  width:44px;height:44px;         /* 44x44px touch target */
+  padding:8px;                    /* Padding around the SVG icon */
+  background:rgba(30,30,30,0.92); /* Near-opaque dark background */
+  border:2px solid rgba(255,255,255,0.4);  /* Visible white border */
+  border-radius:10px;             /* Rounded corners */
+  cursor:pointer;                 /* Hand cursor on hover */
+  display:flex;                   /* Flexbox to center icon */
+  align-items:center;             /* Vertical center */
+  justify-content:center;         /* Horizontal center */
+  transition:background .2s,border-color .2s;  /* Hover animation */
+  -webkit-user-select:none;       /* Prevent text selection */
+  user-select:none;               /* Prevent text selection */
+}
+#rotate-btn:hover{                /* Hover state: cyan glow */
+  background:rgba(0,229,255,0.2);
+  border-color:rgba(0,229,255,0.7);
+}
+#rotate-btn:active{               /* Pressed state: shrink slightly */
+  transform:scale(0.9);
+}
+#rotate-btn svg{                  /* SVG icon sizing */
+  width:24px;                     /* Icon width */
+  height:24px;                    /* Icon height */
+  display:block;                  /* Remove inline spacing */
+}
+
+/* ── Stretch button: to the left of the rotate button ─────────────────────── */
+#stretch-btn{
+  position:fixed;                 /* Fixed to viewport (not affected by scroll) */
+  bottom:18px;                    /* 18px from bottom — same row as rotate button */
+  right:70px;                     /* 18px rotate-right + 44px rotate-width + 8px gap */
+  z-index:99999;                  /* MAXIMUM z-index — must be above EVERYTHING */
+  width:44px;height:44px;         /* 44x44px touch target — same size as rotate btn */
+  padding:8px;                    /* Padding around the SVG icon */
+  background:rgba(30,30,30,0.92); /* Near-opaque dark background */
+  border:2px solid rgba(255,255,255,0.4);  /* Visible white border */
+  border-radius:10px;             /* Rounded corners */
+  cursor:pointer;                 /* Hand cursor on hover */
+  display:flex;                   /* Flexbox to center icon */
+  align-items:center;             /* Vertical center */
+  justify-content:center;         /* Horizontal center */
+  transition:background .2s,border-color .2s;  /* Hover/active animation */
+  -webkit-user-select:none;       /* Prevent text selection on tap */
+  user-select:none;               /* Prevent text selection on tap */
+}
+#stretch-btn:hover{               /* Hover state: orange glow (distinct from rotate cyan) */
+  background:rgba(255,165,0,0.2);
+  border-color:rgba(255,165,0,0.7);
+}
+#stretch-btn:active{              /* Pressed state: shrink slightly */
+  transform:scale(0.9);
+}
+#stretch-btn.stretch-on{          /* Active/engaged state: orange highlight when stretch is ON */
+  background:rgba(255,140,0,0.35);
+  border-color:rgba(255,165,0,0.95);
+}
+#stretch-btn svg{                 /* SVG icon sizing */
+  width:24px;                     /* Icon width */
+  height:24px;                    /* Icon height */
+  display:block;                  /* Remove inline spacing */
+}
+</style>
+</head>
+<body>
+
+<!-- Video element: MSE feeds decoded H.264 video into this -->
+<video id="screen" autoplay muted playsinline></video>
+
+<!-- Hidden audio element: MSE feeds decoded AAC audio into this -->
+<audio id="phoneAudio" autoplay></audio>
+
+<!-- Toast notification: shows status messages briefly -->
+<div id="toast"></div>
+
+<!-- STRETCH BUTTON: fills viewport by swapping dimensions + stretching image -->
+<!-- Positioned to the left of the rotate button. Does NOT auto-rotate. -->
+<!-- Inspired by the stretch icon: outward horizontal arrows indicating expansion. -->
+<button id="stretch-btn" title="Stretch display (swap dims + fill viewport)">
+  <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"
+       stroke="#ffffff" stroke-width="1.6"
+       stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- Left-pointing arrow: indicates stretching to the left edge -->
+    <polyline points="8,9 4,12 8,15"/>          <!-- Left arrowhead -->
+    <line x1="4" y1="12" x2="11" y2="12"/>     <!-- Left arrow shaft -->
+    <!-- Right-pointing arrow: indicates stretching to the right edge -->
+    <polyline points="16,9 20,12 16,15"/>        <!-- Right arrowhead -->
+    <line x1="20" y1="12" x2="13" y2="12"/>    <!-- Right arrow shaft -->
+    <!-- Vertical bounding lines: represent the screen edges being filled -->
+    <line x1="2" y1="6" x2="2" y2="18"/>       <!-- Left edge bar -->
+    <line x1="22" y1="6" x2="22" y2="18"/>     <!-- Right edge bar -->
+  </svg>
+</button>
+
+<!-- ROTATE BUTTON: swaps width/height to toggle portrait/landscape display -->
+<!-- Uses the rotate SVG icon provided by the user -->
+<button id="rotate-btn" title="Rotate display">
+  <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"
+       stroke="#ffffff" stroke-width="1.5"
+       stroke-linecap="square" stroke-linejoin="miter" fill="none">
+    <path d="M22 12l-3 3-3-3"/>                       <!-- Right arrow -->
+    <path d="M2 12l3-3 3 3"/>                          <!-- Left arrow -->
+    <path d="M19.016 14v-1.95A7.05 7.05 0 0 0 8 6.22"/> <!-- Top curve -->
+    <path d="M16.016 17.845A7.05 7.05 0 0 1 5 12.015V10"/> <!-- Bottom curve -->
+    <path stroke-linecap="round" d="M5 10V9"/>        <!-- Bottom tick -->
+    <path stroke-linecap="round" d="M19 15v-1"/>      <!-- Top tick -->
+  </svg>
+</button>
+
+<script>
+"use strict";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE VARIABLES
+// ═══════════════════════════════════════════════════════════════════════════
+
+let ws=null;           // WebSocket connection for video + control
+let audioWs=null;      // WebSocket connection for audio
+let videoMS=null;      // MediaSource object for video
+let videoSB=null;      // SourceBuffer for H.264 video
+let audioMS=null;      // MediaSource object for audio
+let audioSB=null;      // SourceBuffer for AAC audio
+let deviceW=0;         // Device screen width (used for touch mapping + display sizing)
+let deviceH=0;         // Device screen height (used for touch mapping + display sizing)
+let pointerDown=false; // True while user is touching/clicking the screen
+let lastX=0;           // Last sent touch X (to avoid duplicate move events)
+let lastY=0;           // Last sent touch Y
+let videoSeq=0;        // Video fragment sequence counter (for moof boxes)
+let videoIdx=0;        // Video frame index (for PTS calculation)
+let audioSeq=0;        // Audio fragment sequence counter
+let audioIdx=0;        // Audio frame index (for PTS calculation)
+let videoQueue=[];     // Queue of video segments waiting to be appended to MSE
+let audioPending=[];   // Queue of audio segments waiting to be appended
+let sbBusy=false;      // Mutex: video SourceBuffer is currently updating
+let savedSPS=null;     // Cached H.264 SPS NAL unit (from last config packet)
+let savedPPS=null;     // Cached H.264 PPS NAL unit (from last config packet)
+let videoInitDone=false;  // True after video MSE init segment has been appended
+let gotIDR=false;      // True after first IDR (keyframe) is received
+let savedASC=null;     // Cached AAC AudioSpecificConfig (from last config packet)
+let audioInitDone=false;  // True after audio MSE init segment has been appended
+let stretchMode=false; // True when stretch button is active (fill viewport, ignore aspect ratio)
+
+// ── DOM element references ───────────────────────────────────────────────
+const video   = document.getElementById('screen');      // Video element
+const audioEl = document.getElementById('phoneAudio');  // Audio element
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DISPLAY SIZING — fit video to viewport with correct aspect ratio
+// ═══════════════════════════════════════════════════════════════════════════
+
+function fit(){
+  if(!deviceW||!deviceH) return;           // No dimensions yet — skip
+  if(stretchMode){
+    // STRETCH MODE: fill entire viewport — no black bars, aspect ratio is ignored
+    video.style.width  = window.innerWidth  + 'px';  // Stretch to full viewport width
+    video.style.height = window.innerHeight + 'px';  // Stretch to full viewport height
+  } else {
+    // NORMAL MODE: letterbox — scale to fit while maintaining aspect ratio
+    const s=Math.min(window.innerWidth/deviceW, window.innerHeight/deviceH);  // Smallest scale that fits
+    video.style.width  = Math.round(deviceW*s)+'px';  // Set display width
+    video.style.height = Math.round(deviceH*s)+'px';  // Set display height
+  }
+}
+window.addEventListener('resize', fit);    // Re-fit when browser window resizes
+
+// Called when video first loads — pick up initial dimensions from the decoder
+video.addEventListener('loadedmetadata', ()=>{
+  if(video.videoWidth && (video.videoWidth!==deviceW || video.videoHeight!==deviceH)){
+    deviceW=video.videoWidth;              // Update width from decoded video
+    deviceH=video.videoHeight;             // Update height from decoded video
+    fit();                                 // Resize display
+  }
+});
+
+// NOTE: Auto-rotation via video 'resize' event has been removed.
+// Orientation changes are now handled manually via the Rotate and Stretch buttons.
+
+// Update deviceW/deviceH and resize the display
+function setDims(w,h){
+  if(deviceW===w&&deviceH===h) return;     // No change — skip
+  deviceW=w; deviceH=h;                    // Store new dimensions
+  fit();                                   // Resize display
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COORDINATE MAPPING — convert screen clicks to phone coordinates
+// ═══════════════════════════════════════════════════════════════════════════
+
+function toDevice(cx,cy){
+  const r=video.getBoundingClientRect();   // Get video element's screen position
+  return{
+    x:Math.round((cx-r.left)/r.width*deviceW),   // Scale X to device pixels
+    y:Math.round((cy-r.top)/r.height*deviceH)    // Scale Y to device pixels
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BINARY HELPERS — for building fMP4 boxes
+// ═══════════════════════════════════════════════════════════════════════════
+
+const te=new TextEncoder();                                     // UTF-8 encoder for box type strings
+function u16(v){return new Uint8Array([(v>>8)&0xFF,v&0xFF]);}   // Pack u16 big-endian
+function u32(v){const b=new Uint8Array(4);new DataView(b.buffer).setUint32(0,v>>>0,false);return b;}  // Pack u32 big-endian
+function i32(v){const b=new Uint8Array(4);new DataView(b.buffer).setInt32(0,v|0,false);return b;}     // Pack i32 big-endian
+function u64(v){const b=new Uint8Array(8),dv=new DataView(b.buffer);dv.setUint32(0,Math.floor(v/0x100000000)>>>0,false);dv.setUint32(4,v>>>0,false);return b;}  // Pack u64 big-endian
+function cat(...a){const t=a.reduce((s,x)=>s+x.length,0),o=new Uint8Array(t);let p=0;for(const x of a){o.set(x,p);p+=x.length;}return o;}  // Concatenate multiple Uint8Arrays
+function box(t,...p){const d=cat(...p);return cat(u32(8+d.length),te.encode(t),d);}  // Build MP4 box: [size(4)][type(4)][payload]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// H.264 ANNEX-B NAL UNIT PARSER (PROVEN WORKING — do not modify)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function parseAB(buf){
+  const nals=[];                           // Result array of {type, data}
+  for(let i=0;i<buf.length;){
+    // Check for 4-byte start code: 00 00 00 01
+    const s4=i+3<buf.length&&buf[i]===0&&buf[i+1]===0&&buf[i+2]===0&&buf[i+3]===1;
+    // Check for 3-byte start code: 00 00 01
+    const s3=!s4&&i+2<buf.length&&buf[i]===0&&buf[i+1]===0&&buf[i+2]===1;
+    if(!s4&&!s3){i++;continue;}            // No start code here — advance
+    i+=s4?4:3;                             // Skip past the start code
+    const s=i,t=buf[i]&0x1f;              // NAL start position and type (5 bits)
+    let e=buf.length;                      // Default end = buffer end
+    // Find next start code to determine end of this NAL
+    for(let j=i+1;j<buf.length-2;j++){
+      if(buf[j]===0&&buf[j+1]===0&&(buf[j+2]===1||(j+3<buf.length&&buf[j+2]===0&&buf[j+3]===1))){e=j;break;}
+    }
+    nals.push({type:t,data:buf.slice(s,e)});  // Store NAL unit
+    i=e;                                   // Advance to next NAL
+  }
+  return nals;                             // Return all found NALs
+}
+
+// Convert Annex-B (start codes) to AVCC (length-prefixed) format for MP4
+function toAVCC(buf){
+  const nals=parseAB(buf);                 // Parse all NAL units
+  let tot=0;                               // Calculate total output size
+  for(const n of nals)tot+=4+n.data.length;  // 4-byte length prefix + data per NAL
+  const out=new Uint8Array(tot);           // Allocate output buffer
+  let o=0;                                 // Output offset
+  for(const n of nals){
+    const l=n.data.length;
+    // Write 4-byte big-endian length prefix
+    out[o]=(l>>>24)&0xFF;out[o+1]=(l>>>16)&0xFF;out[o+2]=(l>>>8)&0xFF;out[o+3]=l&0xFF;
+    out.set(n.data,o+4);                   // Write NAL data after length
+    o+=4+l;                                // Advance output offset
+  }
+  return out;                              // Return AVCC-format data
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VIDEO fMP4 INIT SEGMENT BUILDER (PROVEN WORKING — do not modify)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildVideoInit(sps,pps,W,H){
+  // avcC box: contains SPS and PPS for the H.264 decoder
+  const avcC=box('avcC',cat(
+    new Uint8Array([1,sps[1],sps[2],sps[3],0xFF,0xE1]),  // Config version, profile, compat, level, NALU length-1, num SPS
+    u16(sps.length),sps,               // SPS length + data
+    new Uint8Array([1]),u16(pps.length),pps));  // num PPS, PPS length + data
+  // avc1 sample entry: wraps avcC with video metadata
+  const avc1=box('avc1',
+    new Uint8Array(6),u16(1),new Uint8Array(16),  // Reserved, data_ref_index, reserved
+    u16(W),u16(H),                     // Width, height
+    u32(0x00480000),u32(0x00480000),   // 72dpi horizontal, 72dpi vertical
+    u32(0),u16(1),                     // Reserved, frame_count=1
+    new Uint8Array(32),                // Compressor name (empty)
+    u16(0x0018),new Uint8Array([0xFF,0xFF]),  // Depth=24, pre_defined=-1
+    avcC);                             // Decoder config
+  // stbl: sample table (empty — we use fragmented MP4)
+  const stbl=box('stbl',
+    box('stsd',new Uint8Array([0,0,0,0]),u32(1),avc1),  // Sample description
+    box('stts',new Uint8Array([0,0,0,0]),u32(0)),        // Time-to-sample (empty)
+    box('stsc',new Uint8Array([0,0,0,0]),u32(0)),        // Sample-to-chunk (empty)
+    box('stsz',new Uint8Array([0,0,0,0]),u32(0),u32(0)), // Sample sizes (empty)
+    box('stco',new Uint8Array([0,0,0,0]),u32(0)));       // Chunk offsets (empty)
+  // minf: media information
+  const minf=box('minf',
+    box('vmhd',new Uint8Array([0,0,0,1]),u16(0),u16(0),u16(0),u16(0)),  // Video media header
+    box('dinf',box('dref',new Uint8Array([0,0,0,0]),u32(1),box('url ',new Uint8Array([0,0,0,1])))),  // Data reference
+    stbl);
+  // mdia: media box
+  const mdia=box('mdia',
+    box('mdhd',new Uint8Array([0,0,0,0]),u32(0),u32(0),u32(90000),u32(0),u16(0x55C4),u16(0)),  // Media header, timescale=90000
+    box('hdlr',new Uint8Array([0,0,0,0]),u32(0),te.encode('vide'),u32(0),u32(0),u32(0),te.encode('VideoHandler\0')),  // Handler: video
+    minf);
+  // tkhd: track header
+  const tkhd=box('tkhd',
+    new Uint8Array([0,0,0,3]),u32(0),u32(0),u32(1),u32(0),u32(0),u32(0),u32(0),  // Flags=3, track_ID=1
+    u16(0),u16(0),u16(0),u16(0),       // Layer, alt_group, volume, reserved
+    u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000),  // Identity matrix
+    u32(W<<16),u32(H<<16));            // Width, height (16.16 fixed point)
+  // mvhd: movie header
+  const mvhd=box('mvhd',
+    new Uint8Array([0,0,0,0]),u32(0),u32(0),u32(90000),u32(0xFFFFFFFF),  // Timescale=90000, duration=max
+    u32(0x00010000),u16(0x0100),u16(0),u32(0),u32(0),  // Rate=1.0, volume=1.0
+    u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000),  // Identity matrix
+    u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(2));  // Pre-defined, next_track_ID=2
+  // ftyp: file type box
+  const ftyp=box('ftyp',te.encode('isom'),u32(0),te.encode('isomiso2avc1mp41'));
+  // moov: movie box (contains all metadata)
+  const moov=box('moov',mvhd,
+    box('trak',tkhd,mdia),             // Track box
+    box('mvex',box('trex',new Uint8Array([0,0,0,0]),u32(1),u32(1),u32(0),u32(0),u32(0))));  // Movie extends (for fragmented MP4)
+  return cat(ftyp,moov);               // Return complete init segment
+}
+
+// Build a video media segment (moof + mdat) for one frame
+function buildVideoSeg(avccData,isIDR,idx){
+  const DUR=3000;                          // Duration per frame (90000/30fps = 3000)
+  videoSeq++;                              // Increment sequence number
+  // trun: track run (one sample per fragment)
+  const trun=box('trun',
+    new Uint8Array([0x00,0x00,0x07,0x01]),  // Flags: data_offset + duration + size + flags present
+    u32(1),                                // sample_count = 1
+    i32(0),                                // data_offset (patched below)
+    u32(DUR),                              // sample_duration
+    u32(avccData.length),                  // sample_size
+    u32(isIDR?0x02000000:0x01010000));     // sample_flags (IDR vs non-IDR)
+  // traf: track fragment
+  const traf=box('traf',
+    box('tfhd',new Uint8Array([0,0,0,0]),u32(1)),                  // Track ID = 1
+    box('tfdt',new Uint8Array([1,0,0,0]),u64(idx*DUR)),            // Decode time (version=1)
+    trun);
+  // moof: movie fragment
+  const moof=box('moof',box('mfhd',new Uint8Array([0,0,0,0]),u32(videoSeq)),traf);
+  // Patch data_offset at byte 84 to point past moof into mdat payload
+  new DataView(moof.buffer).setInt32(84, moof.length+8, false);
+  // Return moof + mdat
+  return cat(moof, box('mdat',avccData));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AUDIO fMP4 INIT + SEGMENT BUILDERS (PROVEN WORKING — do not modify)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function parseASC(asc){
+  // Parse AAC AudioSpecificConfig to extract sample rate and channel count
+  // Bit layout: [5 bits: audioObjectType][4 bits: samplingFreqIndex][4 bits: channels]
+  const freq_table=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350];
+  const freqIdx = ((asc[0]&0x07)<<1)|((asc[1]>>7)&0x01);  // Extract frequency index
+  return{
+    samplerate: freq_table[freqIdx]||44100,  // Look up sample rate (default 44100)
+    channels:   (asc[1]>>3)&0x0f||2,         // Extract channel count (default 2)
+  };
+}
+
+function buildAudioInit(asc){
+  const {samplerate,channels}=parseASC(asc);  // Parse sample rate + channels
+  // ES_Descriptor wrapping AudioSpecificConfig (MPEG-4 descriptor chain)
+  const decSpecific = cat(new Uint8Array([0x05,asc.length]),asc);  // DecoderSpecificInfo tag
+  const decConfig   = cat(
+    new Uint8Array([0x04, 13+decSpecific.length,  // DecoderConfigDescriptor tag + length
+      0x40,     // objectTypeIndication = AAC
+      0x15,     // streamType = audio (0x05<<2) | reserved(1)
+      0,0,0,    // bufferSizeDB (3 bytes)
+      0,0,0,0,  // maxBitrate (4 bytes)
+      0,0,0,0,  // avgBitrate (4 bytes)
+    ]),decSpecific);
+  const slConfig = new Uint8Array([0x06,0x01,0x02]);  // SLConfigDescriptor
+  const esDesc   = cat(
+    new Uint8Array([0x03, 3+decConfig.length+slConfig.length, 0x00,0x01,0x00]),  // ES_Descriptor
+    decConfig, slConfig);
+  const esds = box('esds', new Uint8Array([0,0,0,0]), esDesc);  // esds full box
+  // mp4a sample entry
+  const mp4a=box('mp4a',
+    new Uint8Array(6),u16(1),new Uint8Array(8),  // Reserved, data_ref_index, reserved
+    u16(channels),u16(16),u16(0),u16(0),         // Channels, sample_size=16, compression_id, packet_size
+    u32(samplerate<<16),                         // Sample rate (16.16 fixed point)
+    esds);                                       // Decoder config
+  // Sample table (empty — fragmented MP4)
+  const stbl=box('stbl',
+    box('stsd',new Uint8Array([0,0,0,0]),u32(1),mp4a),
+    box('stts',new Uint8Array([0,0,0,0]),u32(0)),
+    box('stsc',new Uint8Array([0,0,0,0]),u32(0)),
+    box('stsz',new Uint8Array([0,0,0,0]),u32(0),u32(0)),
+    box('stco',new Uint8Array([0,0,0,0]),u32(0)));
+  const minf=box('minf',
+    box('smhd',new Uint8Array([0,0,0,0]),u16(0),u16(0)),  // Sound media header
+    box('dinf',box('dref',new Uint8Array([0,0,0,0]),u32(1),box('url ',new Uint8Array([0,0,0,1])))),
+    stbl);
+  const mdia=box('mdia',
+    box('mdhd',new Uint8Array([0,0,0,0]),u32(0),u32(0),u32(samplerate),u32(0),u16(0x55C4),u16(0)),  // Timescale = sample rate
+    box('hdlr',new Uint8Array([0,0,0,0]),u32(0),te.encode('soun'),u32(0),u32(0),u32(0),te.encode('SoundHandler\0')),
+    minf);
+  const tkhd=box('tkhd',
+    new Uint8Array([0,0,0,3]),u32(0),u32(0),u32(2),u32(0),u32(0),u32(0),u32(0),  // Track ID = 2
+    u16(0),u16(0),u16(0x0100),u16(0),   // Volume = 1.0
+    u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000),
+    u32(0),u32(0));                      // Width=0, height=0 (audio track)
+  const mvhd=box('mvhd',
+    new Uint8Array([0,0,0,0]),u32(0),u32(0),u32(samplerate),u32(0xFFFFFFFF),
+    u32(0x00010000),u16(0x0100),u16(0),u32(0),u32(0),
+    u32(0x00010000),u32(0),u32(0),u32(0),u32(0x00010000),u32(0),u32(0),u32(0),u32(0x40000000),
+    u32(0),u32(0),u32(0),u32(0),u32(0),u32(0),u32(2));
+  const ftyp=box('ftyp',te.encode('isom'),u32(0),te.encode('isomiso2mp41'));
+  const moov=box('moov',mvhd,
+    box('trak',tkhd,mdia),
+    box('mvex',box('trex',new Uint8Array([0,0,0,0]),u32(2),u32(1),u32(0),u32(0),u32(0))));  // Track ID = 2
+  return cat(ftyp,moov);
+}
+
+function buildAudioSeg(aacData,idx){
+  const DUR=1024;                          // AAC-LC: 1024 samples per frame
+  audioSeq++;                              // Increment sequence number
+  const trun=box('trun',
+    new Uint8Array([0x00,0x00,0x07,0x01]),  // Flags
+    u32(1),i32(0),u32(DUR),u32(aacData.length),u32(0x02000000));
+  const traf=box('traf',
+    box('tfhd',new Uint8Array([0,0,0,0]),u32(2)),         // Track ID = 2
+    box('tfdt',new Uint8Array([1,0,0,0]),u64(idx*DUR)),    // Decode time
+    trun);
+  const moof=box('moof',box('mfhd',new Uint8Array([0,0,0,0]),u32(audioSeq)),traf);
+  new DataView(moof.buffer).setInt32(84, moof.length+8, false);  // Patch data_offset
+  return cat(moof, box('mdat',aacData));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MSE PIPELINE — setup, teardown, queue management
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Video MSE ────────────────────────────────────────────────────────────
+function teardownVideo(){
+  videoQueue=[];sbBusy=false;videoInitDone=false;gotIDR=false;videoIdx=0;videoSeq=0;
+  if(videoMS&&videoMS.readyState==='open')try{videoMS.endOfStream();}catch(_){}
+  video.src='';videoSB=null;videoMS=null;
+}
+
+function setupVideo(){
+  teardownVideo();                         // Clean up any existing pipeline
+  videoMS=new MediaSource();               // Create new MediaSource
+  video.src=URL.createObjectURL(videoMS);  // Attach to <video> element
+  videoMS.addEventListener('sourceopen',()=>{
+    // Build MIME type from SPS profile/compat/level bytes
+    const mime='video/mp4; codecs="avc1.'
+      +savedSPS[1].toString(16).padStart(2,'0')
+      +savedSPS[2].toString(16).padStart(2,'0')
+      +savedSPS[3].toString(16).padStart(2,'0')+'"';
+    if(!MediaSource.isTypeSupported(mime)){toast('Video codec unsupported');return;}
+    videoSB=videoMS.addSourceBuffer(mime);  // Create SourceBuffer
+    videoSB.mode='sequence';               // Append in sequence order
+    videoSB.addEventListener('updateend',drainVideo);  // Drain queue after each append
+    videoSB.addEventListener('error',()=>{
+      if(savedSPS&&savedPPS) setTimeout(setupVideo,200);  // SPEED: retry in 200ms (was 500ms)
+    });
+    // Append init segment (ftyp + moov with SPS/PPS embedded)
+    videoSB.appendBuffer(buildVideoInit(savedSPS,savedPPS,deviceW||720,deviceH||1600));
+    videoInitDone=true;                    // MSE pipeline is ready
+    video.play().catch(()=>{});            // SPEED: force playback start immediately
+  },{once:true});                          // Only fire once
+}
+
+function enqueueVideo(d){videoQueue.push(d);drainVideo();}  // Add segment and try to drain
+function drainVideo(){
+  if(sbBusy||!videoSB||videoSB.updating||!videoQueue.length)return;  // Busy or nothing to do
+  const seg=videoQueue.shift();            // Take next segment from queue
+  try{videoSB.appendBuffer(seg);}          // Append to SourceBuffer
+  catch(e){
+    if(e.name==='QuotaExceededError'&&videoSB.buffered.length){  // Buffer full
+      const end=videoSB.buffered.end(videoSB.buffered.length-1);
+      try{videoSB.remove(0,Math.max(0,end-5));}catch(_){}  // Remove old data
+    }
+  }
+}
+
+// ── Audio MSE ────────────────────────────────────────────────────────────
+function teardownAudio(){
+  audioPending=[];audioInitDone=false;audioIdx=0;audioSeq=0;
+  if(audioMS&&audioMS.readyState==='open')try{audioMS.endOfStream();}catch(_){}
+  audioEl.src='';audioSB=null;audioMS=null;
+}
+
+function setupAudio(){
+  teardownAudio();                         // Clean up any existing pipeline
+  audioMS=new MediaSource();               // Create new MediaSource
+  audioEl.src=URL.createObjectURL(audioMS);  // Attach to <audio> element
+  audioMS.addEventListener('sourceopen',()=>{
+    const {samplerate,channels}=parseASC(savedASC);
+    const mime='audio/mp4; codecs="mp4a.40.2"';  // AAC-LC
+    if(!MediaSource.isTypeSupported(mime)){return;}
+    audioSB=audioMS.addSourceBuffer(mime);  // Create SourceBuffer
+    audioSB.mode='sequence';               // Append in sequence order
+    audioSB.addEventListener('updateend',drainAudio);  // Drain queue after each append
+    audioSB.appendBuffer(buildAudioInit(savedASC));     // Append init segment
+    audioInitDone=true;                    // Audio MSE pipeline is ready
+    audioEl.muted=false;                   // Unmute audio
+    audioEl.play().catch(()=>{});          // Try to start playback (may need user interaction)
+  },{once:true});
+}
+
+function enqueueAudio(d){audioPending.push(d);drainAudio();}  // Add + drain
+function drainAudio(){
+  if(!audioSB||audioSB.updating||!audioPending.length)return;  // Busy or nothing
+  const seg=audioPending.shift();          // Take next segment
+  try{audioSB.appendBuffer(seg);}
+  catch(e){
+    if(e.name==='QuotaExceededError'&&audioSB.buffered.length){
+      const end=audioSB.buffered.end(audioSB.buffered.length-1);
+      try{audioSB.remove(0,Math.max(0,end-3));}catch(_){}
+    }
+  }
+}
+
+// Resume audio after user interaction (browser autoplay policy)
+function tryResumeAudio(){
+  if(audioEl.paused&&audioEl.src&&audioEl.src!==location.href){
+    audioEl.play().catch(()=>{});          // Try to resume (silently fail if blocked)
+  }
+}
+document.addEventListener('pointerdown', tryResumeAudio, {passive:true});  // Resume on any click
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PACKET HANDLERS — process frames from WebSocket
+// ═══════════════════════════════════════════════════════════════════════════
+
+function handleVideoPacket(buf){
+  const bytes=new Uint8Array(buf);         // Wrap ArrayBuffer
+  if(bytes.length<9)return;                // Too small — skip
+  const isCfg=!!(bytes[0]&1);             // Bit 0 of first byte = config flag
+  const nal=bytes.slice(9);                // Payload starts at byte 9
+
+  if(isCfg){                               // Config packet: contains SPS + PPS
+    const nals=parseAB(nal);               // Parse NAL units
+    const sps=nals.find(n=>n.type===7);    // Find SPS (type 7)
+    const pps=nals.find(n=>n.type===8);    // Find PPS (type 8)
+    if(!sps||!pps)return;                  // Need both to initialize
+    savedSPS=sps.data; savedPPS=pps.data;  // Cache for MSE init
+    setupVideo();                          // Rebuild MSE pipeline
+    return;
+  }
+  if(!videoInitDone||!videoSB)return;      // MSE not ready yet
+  const nals=parseAB(nal);                 // Parse NAL units
+  const isIDR=nals.some(n=>n.type===5);    // Check if this is a keyframe (IDR)
+  if(!gotIDR&&!isIDR)return;               // Skip non-IDR frames until first IDR
+  gotIDR=true;                             // We have a keyframe — accept all frames now
+  if(videoQueue.length>5)videoQueue.splice(0,videoQueue.length-5);  // Keep queue short
+  enqueueVideo(buildVideoSeg(toAVCC(nal),isIDR,videoIdx++));        // Build segment + enqueue
+}
+
+function handleAudioPacket(buf){
+  const bytes=new Uint8Array(buf);         // Wrap ArrayBuffer
+  if(bytes.length<9)return;                // Too small — skip
+  const isCfg=!!(bytes[0]&1);             // Config flag
+  const data=bytes.slice(9);               // Payload starts at byte 9
+
+  if(isCfg){                               // Config packet: AudioSpecificConfig
+    savedASC=data;                         // Cache the config
+    setupAudio();                          // Rebuild audio MSE pipeline
+    return;
+  }
+  if(!audioInitDone||!audioSB)return;      // Audio MSE not ready
+  if(audioPending.length>20)audioPending.splice(0,audioPending.length-20);  // Keep queue short
+  enqueueAudio(buildAudioSeg(data,audioIdx++));  // Build segment + enqueue
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// JSON MESSAGE HANDLER — device info, errors
+// ═══════════════════════════════════════════════════════════════════════════
+
+function handleJSON(msg){
+  if(msg.type==='device_info'){            // Server sends device name + dimensions
+    setDims(msg.width,msg.height);         // Update display dimensions
+    toast(msg.name+'  '+msg.width+'x'+msg.height);  // Show device info
+  } else if(msg.type==='error'){
+    toast('! '+msg.msg);                   // Show error message
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WEBSOCKET CONNECTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function connectVideoWS(){
+  ws=new WebSocket('ws://'+location.host+'/ws');  // Connect to video+control endpoint
+  ws.binaryType='arraybuffer';             // Receive binary data as ArrayBuffer
+  ws.onopen=()=>{};                        // Nothing to do on open
+  ws.onclose=()=>setTimeout(connectVideoWS,500);  // SPEED: reconnect after 0.5s (was 2s)
+  ws.onerror=()=>{};                       // Errors handled by onclose
+  ws.onmessage=e=>{                        // Route incoming messages
+    if(e.data instanceof ArrayBuffer) handleVideoPacket(e.data);     // Binary = video frame
+    else{try{handleJSON(JSON.parse(e.data));}catch(_){}}             // Text = JSON
+  };
+}
+
+function connectAudioWS(){
+  audioWs=new WebSocket('ws://'+location.host+'/ws/audio');  // Connect to audio endpoint
+  audioWs.binaryType='arraybuffer';        // Binary mode
+  audioWs.onopen=()=>{};
+  audioWs.onclose=()=>setTimeout(connectAudioWS,500);  // SPEED: reconnect after 0.5s (was 2s)
+  audioWs.onerror=()=>{};
+  audioWs.onmessage=e=>{                   // Route incoming messages
+    if(e.data instanceof ArrayBuffer) handleAudioPacket(e.data);  // Binary = audio frame
+  };
+}
+
+function send(o){                          // Send JSON command to server
+  if(ws&&ws.readyState===WebSocket.OPEN)   // Only if connected
+    ws.send(JSON.stringify(o));             // Serialize and send
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ROTATE BUTTON — swap dimensions to force portrait/landscape toggle
+// ═══════════════════════════════════════════════════════════════════════════
+
+document.getElementById('rotate-btn').addEventListener('click',e=>{
+  e.stopPropagation();                     // Don't trigger video touch events
+  if(!deviceW||!deviceH) return;           // No dimensions yet — nothing to swap
+  const tmp=deviceW;                       // Store current width
+  deviceW=deviceH;                         // Width becomes old height
+  deviceH=tmp;                             // Height becomes old width
+  fit();                                   // Resize display to new aspect ratio (letterboxed)
+  toast('Rotated: '+deviceW+'x'+deviceH);  // Show new dimensions
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRETCH BUTTON — swap dims + fill viewport (no aspect-ratio letterboxing)
+// Does NOT auto-rotate. Swaps deviceW/deviceH then stretches to fill window.
+// Touch coordinates remain accurate because toDevice() reads video.getBoundingClientRect().
+// Clicking again restores normal aspect-ratio mode and swaps dims back.
+// ═══════════════════════════════════════════════════════════════════════════
+
+document.getElementById('stretch-btn').addEventListener('click',e=>{
+  e.stopPropagation();                           // Don't trigger video touch events
+  if(!deviceW||!deviceH) return;                 // No dimensions yet — nothing to do
+  // Swap deviceW and deviceH so touch mapping flips to match the stretched display
+  const tmp=deviceW;                             // Store current width
+  deviceW=deviceH;                               // Width becomes old height (landscape swap)
+  deviceH=tmp;                                   // Height becomes old width (landscape swap)
+  // Toggle stretch mode on/off each click
+  stretchMode=!stretchMode;                      // Flip the stretch flag
+  // Update button visual: highlight when stretch is active
+  document.getElementById('stretch-btn').classList.toggle('stretch-on',stretchMode);
+  fit();                                          // Apply new sizing (fill or letterbox)
+  toast(stretchMode                               // Show what mode we're in
+    ? 'Stretch ON: '+deviceW+'x'+deviceH          // Stretch mode label
+    : 'Stretch OFF: '+deviceW+'x'+deviceH);       // Normal mode label
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOUCH/INPUT HANDLING (PROVEN WORKING — do not modify)
+// ═══════════════════════════════════════════════════════════════════════════
+
+video.addEventListener('pointerdown',e=>{
+  tryResumeAudio();                        // Resume audio on first touch (autoplay policy)
+  if(e.button!==0&&e.pointerType==='mouse')return;  // Only left-click for mouse
+  video.setPointerCapture(e.pointerId);    // Capture pointer for reliable move/up events
+  pointerDown=true;                        // Start tracking
+  const p=toDevice(e.clientX,e.clientY);   // Map screen coords to phone coords
+  lastX=p.x;lastY=p.y;                    // Store for duplicate filtering
+  send({type:'touch_down',x:p.x,y:p.y});  // Send touch_down to phone
+});
+video.addEventListener('pointermove',e=>{
+  if(!pointerDown)return;                  // Only track while touching
+  const p=toDevice(e.clientX,e.clientY);   // Map coords
+  if(p.x===lastX&&p.y===lastY)return;     // Skip duplicates
+  lastX=p.x;lastY=p.y;                    // Update last position
+  send({type:'touch_move',x:p.x,y:p.y});  // Send touch_move to phone
+});
+video.addEventListener('pointerup',e=>{
+  if(!pointerDown)return;                  // Only if was touching
+  pointerDown=false;                       // Stop tracking
+  const p=toDevice(e.clientX,e.clientY);   // Map coords
+  send({type:'touch_up',x:p.x,y:p.y});    // Send touch_up to phone
+});
+video.addEventListener('pointercancel',()=>{
+  if(!pointerDown)return;                  // Only if was touching
+  pointerDown=false;                       // Stop tracking
+  send({type:'touch_up',x:lastX,y:lastY});  // Send up at last known position
+});
+video.addEventListener('wheel',e=>{
+  e.preventDefault();                      // Prevent page scroll
+  const p=toDevice(e.clientX,e.clientY);   // Map coords
+  send({type:'scroll',x:p.x,y:p.y,hscroll:0,vscroll:e.deltaY>0?-1:1});  // Send scroll
+},{passive:false});                        // passive:false to allow preventDefault
+video.addEventListener('contextmenu',e=>e.preventDefault());  // Block right-click menu
+
+// ── Keyboard mapping (physical keyboard → Android keycodes) ──────────────
+const KM={Backspace:67,Tab:61,Enter:66,Escape:111,Delete:112,ArrowLeft:21,ArrowRight:22,ArrowUp:19,ArrowDown:20,Home:122,End:123,PageUp:92,PageDown:93};
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT')return;    // Don't intercept form input
+  if(KM[e.key]){                           // Mapped key
+    e.preventDefault();                    // Prevent browser default
+    send({type:'keycode',keycode:KM[e.key]});  // Send keycode to phone
+    return;
+  }
+  if(e.key.length===1&&!e.ctrlKey&&!e.metaKey){  // Printable character
+    e.preventDefault();
+    send({type:'text',text:e.key});        // Send as text input
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOAST NOTIFICATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+let toastTimer;                            // Timer for auto-hide
+function toast(m){
+  const el=document.getElementById('toast');  // Get toast element
+  el.textContent=m;                        // Set message text
+  el.classList.add('show');                 // Make visible
+  clearTimeout(toastTimer);                // Cancel previous auto-hide
+  toastTimer=setTimeout(()=>el.classList.remove('show'),3000);  // Hide after 3 seconds
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INITIALIZATION — connect WebSockets and check server status
+// ═══════════════════════════════════════════════════════════════════════════
+
+setInterval(()=>send({type:'ping'}),10000);  // Keep WebSocket alive with ping every 10s
+connectVideoWS();                          // Connect video + control WebSocket
+connectAudioWS();                          // Connect audio WebSocket
+
+// Check if server already has an active session (auto-started)
+fetch('/api/status').then(r=>r.json()).then(res=>{
+  if(res.running){                         // Session is already running
+    setDims(res.width,res.height);         // Set dimensions
+    toast((res.name||'Android')+'  '+res.width+'x'+res.height);  // Show device info
+  }
+}).catch(()=>{});                          // Ignore fetch errors
+
+</script>
+</body>
+</html>
